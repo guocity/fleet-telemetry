@@ -22,6 +22,8 @@ const (
 	ZMQ Dispatcher = "zmq"
 	// MQTT registers an MQTT dispatcher
 	MQTT Dispatcher = "mqtt"
+	// FileWriter registers a file writer
+	FileWriter Dispatcher = "filewriter"
 )
 
 // BuildTopicName creates a topic from a namespace and a recordName

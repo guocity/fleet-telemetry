@@ -1,0 +1,43 @@
+{
+  "host": "0.0.0.0",
+  "port": 8443,
+  "log_level": "debug",
+  "json_log_enable": true,
+  "namespace": "tesla",
+  "reliable_ack": false,
+  "transmit_decoded_records": true,
+  "monitoring": {
+    "prometheus_metrics_port": 9090,
+    "profiler_port": 0,
+    "profiling_path": ""
+  },
+  "logger": {
+    "verbose": true
+  },
+  "filewriter": {
+    "base_path": "/data/telemetry",
+    "verbose": true
+  },
+  "records": {
+    "alerts": [
+      "logger",
+      "filewriter"
+    ],
+    "errors": [
+      "logger",
+      "filewriter"
+    ],
+    "V": [
+      "logger",
+      "filewriter"
+    ],
+    "connectivity": [
+      "logger",
+      "filewriter"
+    ]
+  },
+  "tls": {
+    "server_cert": "/certs/fleet-telemetry-server/server.crt",
+    "server_key": "/certs/fleet-telemetry-server/server.key"
+  }
+}

@@ -80,6 +80,9 @@ type Config struct {
 	// LoggerConfig configures the simple logger
 	LoggerConfig *simple.Config `json:"logger,omitempty"`
 
+	// FileWriterConfig configures the file writer
+	FileWriterConfig *simple.FileWriterConfig `json:"filewriter,omitempty"`
+
 	// LogLevel set the log-level
 	LogLevel string `json:"log_level,omitempty"`
 
@@ -277,6 +280,15 @@ func (c *Config) ConfigureProducers(airbrakeHandler *airbrake.Handler, logger *l
 
 	producers := make(map[telemetry.Dispatcher]telemetry.Producer)
 	producers[telemetry.Logger] = simple.NewProtoLogger(c.LoggerConfig, logger)
+
+	// Register FileWriter if configured
+	if c.FileWriterConfig != nil {
+		fileWriter, err := simple.NewFileWriter(c.FileWriterConfig, logger)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create file writer: %w", err)
+		}
+		producers[telemetry.FileWriter] = fileWriter
+	}
 
 	requiredDispatchers := make(map[telemetry.Dispatcher][]string)
 	for recordName, dispatchRules := range c.Records {

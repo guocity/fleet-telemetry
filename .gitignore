@@ -8,3 +8,8 @@ vendor/
 config-local.json
 temp
 test/integration/test-certs/
+.*.env
+**/.env
+**/partner_token.txt
+**/thirdparty_token.txt
+**/thirdparty_refresh_token.txt
