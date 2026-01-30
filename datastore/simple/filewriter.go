@@ -111,8 +111,8 @@ func (f *FileProducer) getFilePath(entry *telemetry.Record) string {
 	now := time.Now().UTC()
 	yearMonth := now.Format("2006/01") // YYYY/MM format
 
-	// /data/telemetry/{YYYY}/{MM}/
-	dirPath := filepath.Join(f.Config.BasePath, yearMonth)
+	// /data/telemetry/{VIN}/{YYYY}/{MM}/
+	dirPath := filepath.Join(f.Config.BasePath, entry.Vin, yearMonth)
 
 	// Create directory if it doesn't exist
 	if err := os.MkdirAll(dirPath, 0755); err != nil {
