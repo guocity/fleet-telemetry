@@ -1,11 +1,13 @@
 version: '3.8'
-
+# hostname is fleet-telemetry.lgnat.com:4443 external port 4443 mapped to internal port 8443
 services:
   lg-fleet-telemetry:
     container_name: lg-fleet-telemetry
     image: fleet-telemetry-integration-tests:latest
     ports:
       - "8443:8443"
+      - "4269:4269"
+      - "5284:5284"
       - "9090:9090"
     volumes:
       - ./certs:/certs:ro
