@@ -1,7 +1,6 @@
 package simple
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,10 +10,8 @@ import (
 
 	"github.com/teslamotors/fleet-telemetry/datastore/simple/transformers"
 	logrus "github.com/teslamotors/fleet-telemetry/logger"
-	"github.com/teslamotors/fleet-telemetry/messages"
 	"github.com/teslamotors/fleet-telemetry/protos"
 	"github.com/teslamotors/fleet-telemetry/telemetry"
-	"google.golang.org/protobuf/proto"
 )
 
 // FileWriterConfig for the file writer
@@ -23,13 +20,21 @@ type FileWriterConfig struct {
 	BasePath string `json:"base_path"`
 	// Verbose controls whether types are explicitly shown in the logs. Only applicable for record type 'V'.
 	Verbose bool `json:"verbose"`
+	// EnableDelta enables delta encoding - only stores changed values
+	EnableDelta bool `json:"enable_delta"`
+	// SnapshotInterval writes a full snapshot every N records (0 = only deltas)
+	SnapshotInterval int `json:"snapshot_interval"`
+	// DeltaTTL is how long to keep state for delta tracking (default: 24h)
+	DeltaTTL string `json:"delta_ttl"`
 }
 
 // FileProducer writes telemetry data to JSON files
 type FileProducer struct {
-	Config *FileWriterConfig
-	logger *logrus.Logger
-	mu     sync.Mutex
+	Config       *FileWriterConfig
+	logger       *logrus.Logger
+	mu           sync.Mutex
+	deltaTracker *DeltaTracker
+	recordCount  map[string]int // VIN -> record count for snapshot intervals
 }
 
 // NewFileWriter initializes the file writer
@@ -43,13 +48,31 @@ func NewFileWriter(config *FileWriterConfig, logger *logrus.Logger) (telemetry.P
 		return nil, fmt.Errorf("failed to create base directory: %w", err)
 	}
 
+	var deltaTracker *DeltaTracker
+	if config.EnableDelta {
+		ttl := 24 * time.Hour // default
+		if config.DeltaTTL != "" {
+			if parsedTTL, err := time.ParseDuration(config.DeltaTTL); err == nil {
+				ttl = parsedTTL
+			}
+		}
+		deltaTracker = NewDeltaTracker(ttl)
+		logger.ActivityLog("delta_encoding_enabled", logrus.LogInfo{
+			"ttl":               ttl.String(),
+			"snapshot_interval": config.SnapshotInterval,
+		})
+	}
+
 	logger.ActivityLog("filewriter_initialized", logrus.LogInfo{
-		"base_path": config.BasePath,
+		"base_path":    config.BasePath,
+		"enable_delta": config.EnableDelta,
 	})
 
 	return &FileProducer{
-		Config: config,
-		logger: logger,
+		Config:       config,
+		logger:       logger,
+		deltaTracker: deltaTracker,
+		recordCount:  make(map[string]int),
 	}, nil
 }
 
@@ -70,23 +93,53 @@ func (f *FileProducer) Produce(entry *telemetry.Record) {
 		return
 	}
 
-	// Create the complete record structure with both decoded data and raw payload
-	record := map[string]interface{}{
-		"vin":      entry.Vin,
-		"metadata": entry.Metadata(),
-		"data":     data,
-		"time":     time.Now().UTC().Format(time.RFC3339),
+	// Apply delta encoding if enabled
+	var recordType string
+	if f.Config.EnableDelta && f.deltaTracker != nil {
+		// Check if we should force a snapshot
+		forceSnapshot := false
+		if f.Config.SnapshotInterval > 0 {
+			f.mu.Lock()
+			f.recordCount[entry.Vin]++
+			if f.recordCount[entry.Vin]%f.Config.SnapshotInterval == 1 {
+				forceSnapshot = true
+				f.deltaTracker.ForceSnapshot(entry.Vin)
+			}
+			f.mu.Unlock()
+		}
+		
+		// Get only changed fields
+		dataMap, ok := data.(map[string]interface{})
+		if ok && !forceSnapshot {
+			changes, isFullSnapshot := f.deltaTracker.GetChanges(entry.Vin, dataMap)
+			if len(changes) == 0 {
+				// No changes, skip writing
+				return
+			}
+			data = changes
+			if isFullSnapshot {
+				recordType = "snapshot"
+			} else {
+				recordType = "delta"
+			}
+		} else {
+			recordType = "snapshot"
+		}
+	} else {
+		recordType = "full"
 	}
 
-	// Include raw payload in base64 for debugging/verification
-	if len(entry.Raw()) > 0 {
-		rawBytes := entry.Raw()
-		record["payload"] = base64.StdEncoding.EncodeToString(rawBytes)
-		
-		// Decode the payload and add decoded version
-		if decodedPayload := f.decodePayload(rawBytes, entry.TxType); decodedPayload != nil {
-			record["decoded_payload"] = decodedPayload
-		}
+	// Create the compact record structure
+	record := map[string]interface{}{
+		"vin":  entry.Vin,
+		"time": time.Now().UTC().Format(time.RFC3339),
+		"txid": entry.Txid,
+		"data": data,
+	}
+
+	// Only add record type if delta encoding is enabled
+	if f.Config.EnableDelta {
+		record["type"] = recordType
 	}
 
 	// Write to file
@@ -145,48 +198,6 @@ func (f *FileProducer) writeToFile(record map[string]interface{}, entry *telemet
 	}
 
 	return nil
-}
-
-// decodePayload decodes the raw FlatBuffers payload
-func (f *FileProducer) decodePayload(rawBytes []byte, txType string) map[string]interface{} {
-	streamMsg, err := messages.StreamMessageFromBytes(rawBytes)
-	if err != nil {
-		return nil
-	}
-
-	result := map[string]interface{}{
-		"topic":       streamMsg.Topic(),
-		"txid":        string(streamMsg.TXID),
-		"device_type": string(streamMsg.DeviceType),
-		"device_id":   string(streamMsg.DeviceID),
-		"created_at":  streamMsg.CreatedAt,
-	}
-
-	// Decode the inner payload based on type
-	switch txType {
-	case "alerts":
-		alerts := &protos.VehicleAlerts{}
-		if err := proto.Unmarshal(streamMsg.Payload, alerts); err == nil {
-			result["data"] = alerts
-		}
-	case "V":
-		payload := &protos.Payload{}
-		if err := proto.Unmarshal(streamMsg.Payload, payload); err == nil {
-			result["data"] = payload
-		}
-	case "connectivity":
-		conn := &protos.VehicleConnectivity{}
-		if err := proto.Unmarshal(streamMsg.Payload, conn); err == nil {
-			result["data"] = conn
-		}
-	case "errors":
-		errors := &protos.VehicleErrors{}
-		if err := proto.Unmarshal(streamMsg.Payload, errors); err == nil {
-			result["data"] = errors
-		}
-	}
-
-	return result
 }
 
 // recordToLogMap converts the data of a record to a map or slice of maps
