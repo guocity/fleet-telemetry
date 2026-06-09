@@ -7,9 +7,9 @@ vendor/
 config-local.json
 temp
 test/integration/test-certs/
-telemetry-data/
-.*.env
-**/.env
+telemetry-data
+api-response/
+*.env
 **/partner_token.txt
 **/thirdparty_token.txt
 **/thirdparty_refresh_token.txt
