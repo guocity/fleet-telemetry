@@ -1,0 +1,837 @@
+openapi: 3.0.3
+info:
+  title: Tesla Fleet Telemetry — JSONL File Output Schema
+  description: |
+    Schema describing the JSONL records written by the fleet-telemetry
+    FileWriter datastore (`datastore/simple/filewriter.go`).
+
+    Each line in a `.jsonl` file conforms to one of the record schemas
+    below, determined by the txtype (which is also the filename stem):
+
+    | File               | Schema                | `data` shape       |
+    |--------------------|-----------------------|--------------------|
+    | `V.jsonl`          | VehicleDataRecord     | object (signal map) |
+    | `alerts.jsonl`     | AlertRecord           | array of alerts    |
+    | `connectivity.jsonl` | ConnectivityRecord  | object             |
+    | `errors.jsonl`     | ErrorRecord           | array of errors    |
+
+    File path convention:
+    ```
+    {base_path}/{VIN}/{YYYY}/{MM}/{txtype}.jsonl
+    ```
+
+    Proto sources:
+    - `protos/vehicle_data.proto`      (259 Field enum values, Value oneof)
+    - `protos/vehicle_alert.proto`     (VehicleAlerts, VehicleAlert)
+    - `protos/vehicle_connectivity.proto` (VehicleConnectivity)
+    - `protos/vehicle_error.proto`     (VehicleErrors, VehicleError)
+  version: 1.0.0
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+  contact:
+    name: Fleet Telemetry
+    url: https://github.com/teslamotors/fleet-telemetry
+
+paths: {} # File-output schema — no HTTP endpoints
+
+components:
+  schemas:
+
+    # ═══════════════════════════════════════════════════════════
+    #  COMMON ENVELOPE
+    # ═══════════════════════════════════════════════════════════
+
+    RecordMetadata:
+      type: object
+      description: |
+        Server-side metadata from `telemetry.Record.Metadata()`.
+        Attached to every JSONL line.
+      properties:
+        vin:
+          type: string
+          pattern: '^[A-HJ-NPR-Z0-9]{17}$'
+          description: Vehicle Identification Number
+          example: "7SAYGDEE2PF875122"
+        txtype:
+          type: string
+          enum: [V, alerts, errors, connectivity]
+          description: Telemetry record type
+          example: "V"
+        txid:
+          type: string
+          description: Transaction ID from the vehicle session
+          example: "252624a96e834cc69602ac-000000001"
+        receivedat:
+          type: string
+          description: Unix timestamp in milliseconds when server received the message
+          example: "1769808413000"
+        timestamp:
+          type: string
+          description: Legacy timestamp field
+          example: "0"
+        version:
+          type: string
+          description: Record version
+          example: "0"
+        device_client_version:
+          type: string
+          description: Vehicle firmware telemetry client version
+          example: "1.2.0"
+
+    DecodedPayload:
+      type: object
+      description: |
+        Raw protobuf message serialized to JSON via `protojson`.
+        Only present when `transmitDecodedRecords` is enabled in
+        the server configuration.
+      properties:
+        created_at:
+          type: integer
+          format: int64
+          description: Unix timestamp from the FlatBuffers envelope
+        device_id:
+          type: string
+          description: Vehicle device ID (usually the VIN)
+        device_type:
+          type: string
+          description: Always "vehicle_device"
+        topic:
+          type: string
+          description: Same as txtype
+        txid:
+          type: string
+        data:
+          type: object
+          description: Raw proto payload structure (shape varies by topic)
+
+    # ═══════════════════════════════════════════════════════════
+    #  VEHICLE DATA — V.jsonl
+    # ═══════════════════════════════════════════════════════════
+
+    VehicleDataRecord:
+      type: object
+      description: |
+        One line in `V.jsonl`. Contains decoded vehicle telemetry signals.
+        The `data` field is a flat map of signal names to typed values,
+        plus three fixed envelope fields (`Vin`, `CreatedAt`, `IsResend`).
+      required: [vin, time, data]
+      properties:
+        vin:
+          type: string
+          pattern: '^[A-HJ-NPR-Z0-9]{17}$'
+        time:
+          type: string
+          format: date-time
+          description: Server-side write timestamp (UTC, RFC3339)
+        txid:
+          type: string
+        type:
+          type: string
+          enum: [full, snapshot, delta]
+          description: |
+            Record type for delta encoding. Only present when
+            `enable_delta` is true in FileWriterConfig.
+            - `full`: delta encoding disabled, complete record
+            - `snapshot`: full snapshot (first record or periodic refresh)
+            - `delta`: only changed fields since last snapshot
+        metadata:
+          $ref: '#/components/schemas/RecordMetadata'
+        decoded_payload:
+          $ref: '#/components/schemas/DecodedPayload'
+        payload:
+          type: string
+          format: byte
+          description: Raw FlatBuffers payload (base64-encoded)
+        data:
+          $ref: '#/components/schemas/VehicleData'
+
+    VehicleData:
+      type: object
+      description: |
+        Decoded vehicle telemetry map. Contains three fixed fields
+        plus dynamic signal fields keyed by the `Field` enum name
+        from `vehicle_data.proto` (259 possible signal names).
+
+        When `verbose` / `includeTypes` is enabled (default for FileWriter),
+        each signal value is wrapped in a typed object like
+        `{"stringValue": "Idle"}` or `{"doubleValue": 0.0}`.
+      required: [Vin, CreatedAt, IsResend]
+      properties:
+        Vin:
+          type: string
+          pattern: '^[A-HJ-NPR-Z0-9]{17}$'
+        CreatedAt:
+          type: string
+          format: date-time
+          description: Vehicle-side timestamp when the data was captured
+        IsResend:
+          type: boolean
+          description: Whether this is a retransmission of previously failed data
+      additionalProperties:
+        $ref: '#/components/schemas/SignalValue'
+
+    SignalValue:
+      type: object
+      description: |
+        A typed telemetry signal value. Exactly one of the type keys
+        will be present per signal. The key name indicates the value type.
+
+        Source: `transformers/payload.go` — `transformValue()`
+      properties:
+        # ── Primitive types ──────────────────────────────────
+        stringValue:
+          type: string
+          description: String signal (e.g. ChargeState, VehicleName)
+          example: "Idle"
+        intValue:
+          type: integer
+          format: int32
+          description: 32-bit integer signal (e.g. BatteryLevel, ChargeAmps)
+          example: 85
+        longValue:
+          type: integer
+          format: int64
+          description: 64-bit integer signal (e.g. LifetimeEnergyUsed)
+        floatValue:
+          type: number
+          format: float
+          description: 32-bit float signal
+        doubleValue:
+          type: number
+          format: double
+          description: 64-bit double signal (e.g. VehicleSpeed, Odometer)
+          example: 65.5
+        booleanValue:
+          type: boolean
+          description: Boolean signal (e.g. Locked, BatteryHeaterOn)
+
+        # ── Special types ────────────────────────────────────
+        invalid:
+          oneOf:
+            - type: boolean
+            - type: string
+          description: |
+            Sensor temporarily unavailable.
+            - When `includeTypes` is true: `true`
+            - When `includeTypes` is false: `"<invalid>"`
+
+        # ── Composite types ──────────────────────────────────
+        locationValue:
+          $ref: '#/components/schemas/LocationValue'
+        doorValue:
+          $ref: '#/components/schemas/DoorState'
+        tireLocation:
+          $ref: '#/components/schemas/TireLocation'
+        time:
+          type: string
+          pattern: '^\d{2}:\d{2}:\d{2}$'
+          description: Time-of-day value (HH:MM:SS)
+          example: "14:30:00"
+
+        # ── Enum types (all rendered as proto enum strings) ──
+        shiftStateValue:
+          type: string
+          enum:
+            - ShiftStateUnknown
+            - ShiftStateInvalid
+            - ShiftStateP
+            - ShiftStateR
+            - ShiftStateN
+            - ShiftStateD
+            - ShiftStateSNA
+        detailedChargeState:
+          type: string
+          enum:
+            - DetailedChargeStateUnknown
+            - DetailedChargeStateDisconnected
+            - DetailedChargeStateNoPower
+            - DetailedChargeStateStarting
+            - DetailedChargeStateCharging
+            - DetailedChargeStateComplete
+            - DetailedChargeStateStopped
+        sentryModeState:
+          type: string
+          enum:
+            - SentryModeStateUnknown
+            - SentryModeStateOff
+            - SentryModeStateIdle
+            - SentryModeStateArmed
+            - SentryModeStateAware
+            - SentryModeStatePanic
+            - SentryModeStateQuiet
+        bmsState:
+          type: string
+          enum:
+            - BMSStateUnknown
+            - BMSStateStandby
+            - BMSStateDrive
+            - BMSStateSupport
+            - BMSStateCharge
+            - BMSStateFEIM
+            - BMSStateClearFault
+            - BMSStateFault
+            - BMSStateWeld
+            - BMSStateTest
+            - BMSStateSNA
+        buckleStatus:
+          type: string
+          enum: [BuckleStatusUnknown, BuckleStatusUnlatched, BuckleStatusLatched, BuckleStatusFaulted]
+        carType:
+          type: string
+          enum:
+            - CarTypeUnknown
+            - CarTypeModelS
+            - CarTypeModelX
+            - CarTypeModel3
+            - CarTypeModelY
+            - CarTypeSemiTruck
+            - CarTypeCybertruck
+        chargePort:
+          type: string
+          enum: [ChargePortUnknown, ChargePortUS, ChargePortEU, ChargePortGB, ChargePortCCS]
+        chargePortLatch:
+          type: string
+          enum:
+            - ChargePortLatchUnknown
+            - ChargePortLatchSNA
+            - ChargePortLatchDisengaged
+            - ChargePortLatchEngaged
+            - ChargePortLatchBlocking
+        driveInverterState:
+          type: string
+          enum:
+            - DriveInverterStateUnknown
+            - DriveInverterStateUnavailable
+            - DriveInverterStateStandby
+            - DriveInverterStateFault
+            - DriveInverterStateAbort
+            - DriveInverterStateEnable
+        hvilStatus:
+          type: string
+          enum: [HvilStatusUnknown, HvilStatusFault, HvilStatusOK]
+        windowState:
+          type: string
+          enum: [WindowStateUnknown, WindowStateClosed, WindowStatePartiallyOpen, WindowStateOpened]
+        seatFoldPosition:
+          type: string
+          enum:
+            - SeatFoldPositionUnknown
+            - SeatFoldPositionSNA
+            - SeatFoldPositionFaulted
+            - SeatFoldPositionNotConfigured
+            - SeatFoldPositionFolded
+            - SeatFoldPositionUnfolded
+        laneAssistLevel:
+          type: string
+          enum: [LaneAssistLevelUnknown, LaneAssistLevelNone, LaneAssistLevelWarning, LaneAssistLevelAssist]
+        scheduledChargingMode:
+          type: string
+          enum:
+            - ScheduledChargingModeUnknown
+            - ScheduledChargingModeOff
+            - ScheduledChargingModeStartAt
+            - ScheduledChargingModeDepartBy
+        speedAssistLevel:
+          type: string
+          enum: [SpeedAssistLevelUnknown, SpeedAssistLevelNone, SpeedAssistLevelDisplay, SpeedAssistLevelChime]
+        followDistance:
+          type: string
+          enum:
+            - FollowDistanceUnknown
+            - FollowDistance1
+            - FollowDistance2
+            - FollowDistance3
+            - FollowDistance4
+            - FollowDistance5
+            - FollowDistance6
+            - FollowDistance7
+        forwardCollisionSensitivity:
+          type: string
+          enum:
+            - ForwardCollisionSensitivityUnknown
+            - ForwardCollisionSensitivityOff
+            - ForwardCollisionSensitivityLate
+            - ForwardCollisionSensitivityAverage
+            - ForwardCollisionSensitivityEarly
+        guestModeMobileAccess:
+          type: string
+          description: Guest mode mobile access state (19 possible values)
+        hvacAutoMode:
+          type: string
+          enum: [HvacAutoModeStateUnknown, HvacAutoModeStateOn, HvacAutoModeStateOverride]
+        cabinOverheatProtectionMode:
+          type: string
+          enum:
+            - CabinOverheatProtectionModeStateUnknown
+            - CabinOverheatProtectionModeStateOff
+            - CabinOverheatProtectionModeStateOn
+            - CabinOverheatProtectionModeStateFanOnly
+        cabinOverheatProtectionTemperatureLimit:
+          type: string
+          enum:
+            - ClimateOverheatProtectionTempLimitUnknown
+            - ClimateOverheatProtectionTempLimitHigh
+            - ClimateOverheatProtectionTempLimitMedium
+            - ClimateOverheatProtectionTempLimitLow
+        defrostMode:
+          type: string
+          enum:
+            - DefrostModeStateUnknown
+            - DefrostModeStateOff
+            - DefrostModeStateNormal
+            - DefrostModeStateMax
+            - DefrostModeStateAutoDefog
+        climateKeeperMode:
+          type: string
+          enum:
+            - ClimateKeeperModeStateUnknown
+            - ClimateKeeperModeStateOff
+            - ClimateKeeperModeStateOn
+            - ClimateKeeperModeStateDog
+            - ClimateKeeperModeStateParty
+        hvacPower:
+          type: string
+          enum:
+            - HvacPowerStateUnknown
+            - HvacPowerStateOff
+            - HvacPowerStateOn
+            - HvacPowerStatePrecondition
+            - HvacPowerStateOverheatProtect
+        fastChargerType:
+          type: string
+          enum:
+            - FastChargerUnknown
+            - FastChargerSupercharger
+            - FastChargerCHAdeMO
+            - FastChargerGB
+            - FastChargerACSingleWireCAN
+            - FastChargerCombo
+            - FastChargerMCSingleWireCAN
+            - FastChargerOther
+            - FastChargerSNA
+        chargingCableType:
+          type: string
+          enum: [CableTypeUnknown, CableTypeIEC, CableTypeSAE, CableTypeGB_AC, CableTypeGB_DC, CableTypeSNA]
+        tonneauTentMode:
+          type: string
+          enum:
+            - TonneauTentModeStateUnknown
+            - TonneauTentModeStateInactive
+            - TonneauTentModeStateMoving
+            - TonneauTentModeStateFailed
+            - TonneauTentModeStateActive
+        tonneauPosition:
+          type: string
+          enum:
+            - TonneauPositionStateUnknown
+            - TonneauPositionStateInvalid
+            - TonneauPositionStateClosed
+            - TonneauPositionStatePartiallyOpen
+            - TonneauPositionStateFullyOpen
+        powershareStatus:
+          type: string
+          enum:
+            - PowershareStateUnknown
+            - PowershareStateInactive
+            - PowershareStateHandshaking
+            - PowershareStateInit
+            - PowershareStateEnabled
+            - PowershareStateEnabledReconnectingSoon
+            - PowershareStateStopped
+        powershareStopReason:
+          type: string
+          enum:
+            - PowershareStopReasonStatusUnknown
+            - PowershareStopReasonStatusNone
+            - PowershareStopReasonStatusSOCTooLow
+            - PowershareStopReasonStatusRetry
+            - PowershareStopReasonStatusFault
+            - PowershareStopReasonStatusUser
+            - PowershareStopReasonStatusReconnecting
+            - PowershareStopReasonStatusAuthentication
+        powershareType:
+          type: string
+          enum:
+            - PowershareTypeStatusUnknown
+            - PowershareTypeStatusNone
+            - PowershareTypeStatusLoad
+            - PowershareTypeStatusHome
+        displayState:
+          type: string
+          enum:
+            - DisplayStateUnknown
+            - DisplayStateOff
+            - DisplayStateDim
+            - DisplayStateAccessory
+            - DisplayStateOn
+            - DisplayStateDriving
+            - DisplayStateCharging
+            - DisplayStateLock
+            - DisplayStateSentry
+            - DisplayStateDog
+            - DisplayStateEntertainment
+        distanceUnit:
+          type: string
+          enum: [DistanceUnitUnknown, DistanceUnitMiles, DistanceUnitKilometers]
+        temperatureUnit:
+          type: string
+          enum: [TemperatureUnitUnknown, TemperatureUnitFahrenheit, TemperatureUnitCelsius]
+        pressureUnit:
+          type: string
+          enum: [PressureUnitUnknown, PressureUnitPsi, PressureUnitBar]
+        chargeUnit:
+          type: string
+          enum: [ChargeUnitUnknown, ChargeUnitDistance, ChargeUnitPercent]
+        sunroofInstalledState:
+          type: string
+          enum:
+            - SunroofInstalledStateUnknown
+            - SunroofInstalledStateNotInstalled
+            - SunroofInstalledStateGen1Installed
+            - SunroofInstalledStateGen2Installed
+        turnSignalState:
+          type: string
+          enum: [TurnSignalStateUnknown, TurnSignalStateOff, TurnSignalStateLeft, TurnSignalStateRight, TurnSignalStateBoth]
+        mediaStatus:
+          type: string
+          enum: [MediaStatusUnknown, MediaStatusStopped, MediaStatusPlaying, MediaStatusPaused]
+        tractorAirStatus:
+          type: string
+          enum:
+            - TractorAirStatusUnknown
+            - TractorAirStatusNotAvailable
+            - TractorAirStatusError
+            - TractorAirStatusCharged
+            - TractorAirStatusBuildingPressureIntermediate
+            - TractorAirStatusExhaustingPressureIntermediate
+            - TractorAirStatusExhausted
+        trailerAirStatus:
+          type: string
+          enum:
+            - TrailerAirStatusUnknown
+            - TrailerAirStatusSNA
+            - TrailerAirStatusInvalid
+            - TrailerAirStatusBobtailMode
+            - TrailerAirStatusCharged
+            - TrailerAirStatusBuildingPressureIntermediate
+            - TrailerAirStatusExhaustingPressureIntermediate
+            - TrailerAirStatusExhausted
+
+    # ── Composite value types ────────────────────────────────
+
+    LocationValue:
+      type: object
+      description: GPS location (Field 21 — Location)
+      required: [latitude, longitude]
+      properties:
+        latitude:
+          type: number
+          format: double
+          example: 37.412374
+        longitude:
+          type: number
+          format: double
+          example: -122.145867
+
+    DoorState:
+      type: object
+      description: Door open/close status (Field 58 — DoorState)
+      properties:
+        DriverFront:
+          type: boolean
+        PassengerFront:
+          type: boolean
+        DriverRear:
+          type: boolean
+        PassengerRear:
+          type: boolean
+        TrunkFront:
+          type: boolean
+        TrunkRear:
+          type: boolean
+
+    TireLocation:
+      type: object
+      description: |
+        TPMS tire pressure warning locations (Fields 224-225).
+        Semi-truck fields only present when VIN[3] == 'T'.
+      properties:
+        FrontLeft:
+          type: boolean
+        FrontRight:
+          type: boolean
+        RearLeft:
+          type: boolean
+        RearRight:
+          type: boolean
+        # Semi-truck only
+        SemiMiddleAxleLeft:
+          type: boolean
+        SemiMiddleAxleRight:
+          type: boolean
+        SemiMiddleAxleLeft2:
+          type: boolean
+        SemiMiddleAxleRight2:
+          type: boolean
+        SemiRearAxleLeft:
+          type: boolean
+        SemiRearAxleRight:
+          type: boolean
+        SemiRearAxleLeft2:
+          type: boolean
+        SemiRearAxleRight2:
+          type: boolean
+
+    # ── Signal field name reference ──────────────────────────
+    # Full list of 259 Field enum values from vehicle_data.proto:
+    #
+    #   DriveRail(1), ChargeState(2), BmsFullchargecomplete(3),
+    #   VehicleSpeed(4), Odometer(5), PackVoltage(6), PackCurrent(7),
+    #   Soc(8), DCDCEnable(9), Gear(10), IsolationResistance(11),
+    #   PedalPosition(12), BrakePedal(13), DiStateR(14),
+    #   DiHeatsinkTR(15), DiAxleSpeedR(16), DiTorquemotor(17),
+    #   DiStatorTempR(18), DiVBatR(19), DiMotorCurrentR(20),
+    #   Location(21), GpsState(22), GpsHeading(23),
+    #   NumBrickVoltageMax(24), BrickVoltageMax(25),
+    #   NumBrickVoltageMin(26), BrickVoltageMin(27),
+    #   NumModuleTempMax(28), ModuleTempMax(29),
+    #   NumModuleTempMin(30), ModuleTempMin(31),
+    #   RatedRange(32), Hvil(33), DCChargingEnergyIn(34),
+    #   DCChargingPower(35), ACChargingEnergyIn(36),
+    #   ACChargingPower(37), ChargeLimitSoc(38),
+    #   FastChargerPresent(39), EstBatteryRange(40),
+    #   IdealBatteryRange(41), BatteryLevel(42),
+    #   TimeToFullCharge(43), ScheduledChargingStartTime(44),
+    #   ScheduledChargingPending(45), ScheduledDepartureTime(46),
+    #   PreconditioningEnabled(47), ScheduledChargingMode(48),
+    #   ChargeAmps(49), ChargeEnableRequest(50),
+    #   ChargerPhases(51), ChargePortColdWeatherMode(52),
+    #   ChargeCurrentRequest(53), ChargeCurrentRequestMax(54),
+    #   BatteryHeaterOn(55), NotEnoughPowerToHeat(56),
+    #   SuperchargerSessionTripPlanner(57), DoorState(58),
+    #   Locked(59), FdWindow(60), FpWindow(61),
+    #   RdWindow(62), RpWindow(63), VehicleName(64),
+    #   SentryMode(65), SpeedLimitMode(66), CurrentLimitMph(67),
+    #   Version(68), TpmsPressureFl(69), TpmsPressureFr(70),
+    #   TpmsPressureRl(71), TpmsPressureRr(72),
+    #   ... (73-80: Semi TPMS), TpmsLastSeenPressureTimeFl(81),
+    #   ... InsideTemp(85), OutsideTemp(86), SeatHeaterLeft(87),
+    #   ... LateralAcceleration(98), LongitudinalAcceleration(99),
+    #   ... CruiseSetSpeed(101), LifetimeEnergyUsed(102),
+    #   ... BrakePedalPos(106), RouteLine(108), MilesToArrival(109),
+    #   ... CarType(113), Trim(114), ExteriorColor(115),
+    #   ... ChargePort(117), ChargePortLatch(118),
+    #   ... GuestModeEnabled(123), PinToDriveEnabled(124),
+    #   ... CruiseFollowDistance(126), ForwardCollisionWarning(130),
+    #   ... DiStateF(135), EnergyRemaining(158), BMSState(160),
+    #   ... DetailedChargeState(179),
+    #   ... CabinOverheatProtectionMode(180),
+    #   ... HvacPower(201), PowershareStatus(208),
+    #   ... SoftwareUpdateVersion(220), TonneauPosition(222),
+    #   ... SettingDistanceUnit(232), SettingTemperatureUnit(233),
+    #   ... LightsTurnSignal(240), MediaPlaybackStatus(242),
+    #   ... SunroofInstalled(253), ChargeRateMilePerHour(256),
+    #   ... MilesSinceReset(258), SelfDrivingMilesSinceReset(259)
+
+    # ═══════════════════════════════════════════════════════════
+    #  ALERTS — alerts.jsonl
+    # ═══════════════════════════════════════════════════════════
+
+    AlertRecord:
+      type: object
+      description: |
+        One line in `alerts.jsonl`. Contains one or more vehicle alerts
+        from a single telemetry message. The `data` field is an array
+        because each proto `VehicleAlerts` message may contain multiple alerts.
+      required: [vin, time, data]
+      properties:
+        vin:
+          type: string
+          pattern: '^[A-HJ-NPR-Z0-9]{17}$'
+        time:
+          type: string
+          format: date-time
+          description: Server-side write timestamp (UTC)
+        txid:
+          type: string
+        type:
+          type: string
+          enum: [full, snapshot, delta]
+        metadata:
+          $ref: '#/components/schemas/RecordMetadata'
+        decoded_payload:
+          $ref: '#/components/schemas/DecodedPayload'
+        payload:
+          type: string
+          format: byte
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/VehicleAlert'
+
+    VehicleAlert:
+      type: object
+      description: |
+        A single vehicle alert. An alert is "active" if `EndedAt` is null.
+        Source: `transformers/vehicle_alert.go`
+      required: [Name]
+      properties:
+        Name:
+          type: string
+          description: |
+            Alert code identifier. Common codes include:
+            - `DI_a183_holdReleaseRqrd` — Press brake to shift from Park
+            - `DI_vehicleSpeed_High` — Speeding alert
+            - `DI_lowBattery` — Low battery warning
+          example: "DI_a183_holdReleaseRqrd"
+        Audiences:
+          type: array
+          nullable: true
+          description: Target audiences for this alert
+          items:
+            type: string
+            enum: [Unknown, Customer, Service, ServiceFix]
+          example: ["Customer", "Service"]
+        StartedAt:
+          type: integer
+          format: int64
+          description: Unix timestamp (seconds) when the alert started
+          example: 1769282424
+        EndedAt:
+          type: integer
+          format: int64
+          nullable: true
+          description: |
+            Unix timestamp (seconds) when the alert ended.
+            Null/absent if the alert is still active.
+          example: 1769282426
+
+    # ═══════════════════════════════════════════════════════════
+    #  CONNECTIVITY — connectivity.jsonl
+    # ═══════════════════════════════════════════════════════════
+
+    ConnectivityRecord:
+      type: object
+      description: |
+        One line in `connectivity.jsonl`. Tracks vehicle connection
+        and disconnection events. Very low volume — typically 2 records
+        per session (connect + disconnect).
+      required: [vin, time, data]
+      properties:
+        vin:
+          type: string
+          pattern: '^[A-HJ-NPR-Z0-9]{17}$'
+        time:
+          type: string
+          format: date-time
+        txid:
+          type: string
+        type:
+          type: string
+          enum: [full, snapshot, delta]
+        metadata:
+          $ref: '#/components/schemas/RecordMetadata'
+        decoded_payload:
+          $ref: '#/components/schemas/DecodedPayload'
+        payload:
+          type: string
+          format: byte
+        data:
+          $ref: '#/components/schemas/ConnectivityData'
+
+    ConnectivityData:
+      type: object
+      description: |
+        Vehicle connectivity event data.
+        Source: `transformers/vehicle_connectivity.go`
+      required: [Vin, ConnectionID, Status, NetworkInterface, CreatedAt]
+      properties:
+        Vin:
+          type: string
+          pattern: '^[A-HJ-NPR-Z0-9]{17}$'
+          example: "7SAYGDEE2PF875122"
+        ConnectionID:
+          type: string
+          format: uuid
+          description: Unique session identifier — same for CONNECTED and DISCONNECTED pair
+          example: "3cc8f8e1-f604-4f71-93a2-7e65fedaf8b7"
+        Status:
+          type: string
+          enum: [UNKNOWN, CONNECTED, DISCONNECTED]
+          description: Connection state from `ConnectivityEvent` enum
+          example: "CONNECTED"
+        NetworkInterface:
+          type: string
+          description: Network type used for connection
+          enum: [wifi, lte]
+          example: "wifi"
+        CreatedAt:
+          type: integer
+          format: int64
+          description: Unix timestamp (seconds) when the event occurred
+          example: 1769808413
+
+    # ═══════════════════════════════════════════════════════════
+    #  ERRORS — errors.jsonl
+    # ═══════════════════════════════════════════════════════════
+
+    ErrorRecord:
+      type: object
+      description: |
+        One line in `errors.jsonl`. Contains zero or more vehicle diagnostic
+        errors from a single telemetry message. The `data` array may be empty
+        if the vehicle reports no active errors.
+      required: [vin, time, data]
+      properties:
+        vin:
+          type: string
+          pattern: '^[A-HJ-NPR-Z0-9]{17}$'
+        time:
+          type: string
+          format: date-time
+        txid:
+          type: string
+        type:
+          type: string
+          enum: [full, snapshot, delta]
+        metadata:
+          $ref: '#/components/schemas/RecordMetadata'
+        decoded_payload:
+          $ref: '#/components/schemas/DecodedPayload'
+        payload:
+          type: string
+          format: byte
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/VehicleError'
+
+    VehicleError:
+      type: object
+      description: |
+        A single vehicle diagnostic error.
+        Source: `transformers/vehicle_error.go`
+      required: [Name]
+      properties:
+        Name:
+          type: string
+          description: Diagnostic trouble code identifier
+          example: "DTC_BATTERY_TEMP_HIGH"
+        Body:
+          type: string
+          description: Human-readable error description
+          example: "Battery temperature exceeded normal range"
+        Tags:
+          type: object
+          additionalProperties:
+            type: string
+          description: Key-value metadata tags (severity, system, etc.)
+          example:
+            severity: "warning"
+            system: "battery"
+        CreatedAt:
+          type: integer
+          format: int64
+          description: Unix timestamp (seconds) when the error occurred
+          example: 1769798668
