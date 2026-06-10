@@ -340,7 +340,9 @@ func (p *Producer) produceAlerts(ctx context.Context, entry *telemetry.Record, p
 			 ON CONFLICT (vehicle_id, alert_id, started_at) DO UPDATE SET
 			   ended_at      = COALESCE(alert_episodes.ended_at, EXCLUDED.ended_at),
 			   audiences     = COALESCE(EXCLUDED.audiences, alert_episodes.audiences),
-			   last_reported = GREATEST(alert_episodes.last_reported, EXCLUDED.last_reported)`,
+			   last_reported = GREATEST(alert_episodes.last_reported, EXCLUDED.last_reported)
+			 WHERE alert_episodes.ended_at IS NULL
+			    OR (alert_episodes.audiences IS NULL AND EXCLUDED.audiences IS NOT NULL)`,
 			vid, ep.alertID, ep.startedAt, ep.endedAt, ep.audiences, now)
 	}
 	if err := p.pool.SendBatch(ctx, batch).Close(); err != nil {

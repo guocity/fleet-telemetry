@@ -120,7 +120,9 @@ CREATE TABLE IF NOT EXISTS alert_episodes (
     started_at    timestamptz NOT NULL,
     ended_at      timestamptz,
     audiences     text[],                 -- sorted, e.g. {Customer,Service}
-    last_reported timestamptz,            -- envelope time of last re-send
+    last_reported timestamptz,            -- envelope time of last re-send seen
+                                          -- while the episode was open (closed
+                                          -- episodes are immutable)
     PRIMARY KEY (vehicle_id, alert_id, started_at)
 );
 

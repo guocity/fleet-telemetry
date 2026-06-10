@@ -1,4 +1,3 @@
-version: '3.8'
 # hostname is fleet-telemetry.lgnat.com:4443 external port 4443 mapped to internal port 8443
 services:
   lg-fleet-telemetry:
@@ -11,7 +10,7 @@ services:
       - "9090:9090"
     volumes:
       - ./certs:/certs:ro
-      - ./config/lg-server-config.json:/etc/fleet-telemetry/config.json:ro
+      - ./config/timescale-server-config.json:/etc/fleet-telemetry/config.json:ro
       - ./telemetry-data:/data/telemetry
     command: ["/fleet-telemetry", "-config=/etc/fleet-telemetry/config.json"]
     environment:
