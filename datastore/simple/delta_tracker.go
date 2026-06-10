@@ -42,14 +42,14 @@ func (dt *DeltaTracker) GetChanges(vin string, currentData map[string]interface{
 	
 	// If no previous state exists, or state is too old, return full snapshot
 	if !exists {
-		dt.lastState[vin] = deepCopy(currentData)
+		dt.lastState[vin] = deepCopy(currentData).(map[string]interface{})
 		dt.lastUpdate[vin] = time.Now()
 		return currentData, true
 	}
-	
+
 	// Check if state is stale
 	if time.Since(dt.lastUpdate[vin]) > dt.ttl {
-		dt.lastState[vin] = deepCopy(currentData)
+		dt.lastState[vin] = deepCopy(currentData).(map[string]interface{})
 		dt.lastUpdate[vin] = time.Now()
 		return currentData, true
 	}

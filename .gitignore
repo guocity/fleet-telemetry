@@ -13,3 +13,4 @@ api-response/
 **/partner_token.txt
 **/thirdparty_token.txt
 **/thirdparty_refresh_token.txt
+.venv

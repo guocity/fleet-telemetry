@@ -1,751 +1,312 @@
-# TimescaleDB Storage Guide for Fleet Telemetry
+# Fleet Telemetry — Compact TimescaleDB Storage
 
-This guide describes how to efficiently store Tesla fleet telemetry data
-(from the JSONL file output) in [TimescaleDB](https://www.timescale.com/).
+Design and operations guide for storing Tesla fleet-telemetry data in
+TimescaleDB **without storing repetitive values**. Everything here was
+validated against the real data in `telemetry-data/` (2 vehicles,
+Jan–Jun 2026, 45.4 MB of JSONL) on the actual server
+(`192.168.18.2:5432`, PostgreSQL 16.14 + TimescaleDB 2.27.1, database
+`fleet_telemetry`).
 
-See [fleet-telemetry-output.openapi.yaml](fleet-telemetry-output.openapi.yaml)
-for the complete schema of each JSONL record type.
-
----
-
-## Table of Contents
-
-- [Architecture Overview](#architecture-overview)
-- [Why TimescaleDB?](#why-timescaledb)
-- [Schema Design](#schema-design)
-  - [Why EAV Over Wide Table](#why-eav-over-wide-table)
-  - [Table: vehicle_signals](#table-vehicle_signals)
-  - [Table: vehicle_alerts](#table-vehicle_alerts)
-  - [Table: vehicle_connectivity](#table-vehicle_connectivity)
-  - [Table: vehicle_errors](#table-vehicle_errors)
-- [Compression](#compression)
-- [Retention Policies](#retention-policies)
-- [Continuous Aggregates](#continuous-aggregates)
-- [Ingestion Strategy](#ingestion-strategy)
-  - [Transforming V.jsonl](#transforming-vjsonl)
-  - [Transforming alerts.jsonl](#transforming-alertsjsonl)
-  - [Transforming connectivity.jsonl](#transforming-connectivityjsonl)
-  - [Transforming errors.jsonl](#transforming-errorsjsonl)
-  - [Batch Loading with COPY](#batch-loading-with-copy)
-- [Example Queries](#example-queries)
-- [Docker Setup](#docker-setup)
-- [Storage Estimates](#storage-estimates)
+> The JSONL **FileWriter was a temporary workaround** while no database
+> existed. The server now writes directly to TimescaleDB via the
+> `datastore/timescale` Go producer (`"records": {"V": ["timescale"], ...}`,
+> see `timescale-server-config.json`). The JSONL files are only needed once
+> more, for historical backfill via `scripts/ingest_jsonl.py`.
 
 ---
 
-## Architecture Overview
+## Measured redundancy (why this design)
+
+`scripts/inspect_telemetry.py` over the real data:
+
+| Finding | Number |
+|---|---|
+| JSONL bytes that are duplicate envelope blobs (`decoded_payload` + `payload` + `metadata`) | **71.8%** of all bytes |
+| Signal observations that repeat the previous value unchanged | **71.8%** (77,857 of 108,449) |
+| Alert entries that are re-sends of an already-known episode | **98.3%** (54,034 entries → 893 distinct, 60.5× duplication) |
+| Connectivity / error duplication | none |
+
+So the two big levers are: **(1) don't store the envelope blobs at all,
+(2) store a signal row only when the value changes** ("change-only"
+storage). Alerts collapse to one row per episode.
+
+### Validated result
+
+| | Raw JSONL | Database |
+|---|---|---|
+| 2 vehicles × ~5 months | 45.4 MB | **~4.2 MB** of table+index data |
+| Signal rows | 108,449 observations | 30,573 change rows (2,712 kB incl. index, compressed) |
+| Alert rows | 54,034 entries | 640 episodes (128 kB) |
+
+≈ **11× smaller than the JSONL**, and ≈ **40× smaller** than the naive
+"one row per observation + every alert entry" SQL design. At the
+observed telemetry rate this is **~3.3 MB per vehicle-year**, i.e.
+~1 GB/year for 300 vehicles — hundreds of cars fit comfortably; you
+will not be wasting hundreds of gigabytes on repeats.
+
+---
+
+## Architecture
 
 ```
-┌──────────────┐     ┌──────────────────┐     ┌──────────────────────┐
-│   Vehicle    │────▶│  Fleet Telemetry │────▶│  JSONL Files         │
-│  (via TLS)   │     │  Server          │     │  V.jsonl             │
-│              │     │  (filewriter.go) │     │  alerts.jsonl        │
-└──────────────┘     └──────────────────┘     │  connectivity.jsonl  │
-                                              │  errors.jsonl        │
-                                              └──────────┬───────────┘
-                                                         │
-                                                   Ingestion Script
-                                                   (Go or Python)
-                                                         │
-                                              ┌──────────▼───────────┐
-                                              │  TimescaleDB         │
-                                              │  ┌────────────────┐  │
-                                              │  │vehicle_signals │  │  ← highest volume
-                                              │  │vehicle_alerts  │  │
-                                              │  │vehicle_conn.   │  │
-                                              │  │vehicle_errors  │  │
-                                              │  └────────────────┘  │
-                                              └──────────────────────┘
+┌──────────┐    ┌─────────────────────┐
+│ Vehicle  │───▶│ Fleet Telemetry     │   datastore/timescale producer
+│ (TLS)    │    │ Server ("timescale" │──────────────▶  TimescaleDB  fleet_telemetry
+└──────────┘    │  record dispatcher) │              ├ signal_changes   (hypertable, change-only)
+                └─────────────────────┘              ├ signal_latest    (current state, O(1))
+                                                     ├ alert_episodes   (deduplicated lifecycle)
+   old JSONL files ──▶ scripts/ingest_jsonl.py ────▶ ├ connectivity_events
+   (one-time historical backfill)                    ├ error_events
+                                                     └ vehicles / signals / alert_types (dims)
 ```
 
----
+The Go producer ([datastore/timescale/producer.go](../datastore/timescale/producer.go))
+does the same change-only dedup as the backfill script: it loads
+`signal_latest` into memory at startup, drops unchanged observations,
+batches inserts (`COPY`, default 500 rows / 2 s flush), and upserts
+alert episodes and natural-key events. Configure it with:
 
-## Why TimescaleDB?
-
-| Feature | Benefit for Telemetry |
-|---------|----------------------|
-| **Hypertables** | Automatic time-based partitioning — old chunks compress/drop without table locks |
-| **Compression** | 90-95% storage reduction for historical telemetry data |
-| **Continuous aggregates** | Pre-computed rollups (hourly/daily) for dashboards |
-| **Full SQL** | JOINs, window functions, CTEs — no query language limitations |
-| **PostgreSQL ecosystem** | Works with every PostgreSQL tool (psql, pgAdmin, Grafana, etc.) |
-| **Retention policies** | Automatic old-data cleanup without cron jobs |
-
----
-
-## Schema Design
-
-### Why EAV Over Wide Table
-
-Vehicle telemetry has **259 possible signal fields** (defined in `protos/vehicle_data.proto`),
-but each record typically contains only **2–5 signals**. This makes a wide table (one column
-per signal) extremely wasteful:
-
-| Criterion | Wide Table (259 cols) | EAV (signal per row) |
-|-----------|----------------------|---------------------|
-| **Sparsity** | 254+ NULL columns per row | No NULLs — only present signals stored |
-| **Schema evolution** | `ALTER TABLE ADD COLUMN` for new signals | Zero schema changes |
-| **Compression** | Poor — NULLs compress but waste catalog space | Excellent — homogeneous data per segment |
-| **Query: "ChargeState for VIN X"** | Scans wide rows | Direct index hit on `(vin, signal_name, time)` |
-| **Query: "latest state for VIN X"** | Returns 259 cols, most NULL | `DISTINCT ON (signal_name)` |
-| **Disk usage** | ~60% wasted on NULLs | Compact, real data only |
-
-> **Note:** If you need a wide view, create it as a **continuous aggregate** or **pivot view**
-> on top of the EAV table. Don't make the base table wide.
-
----
-
-### Table: `vehicle_signals`
-
-Stores decoded vehicle telemetry from `V.jsonl`. **Highest volume table.**
-
-```sql
-CREATE EXTENSION IF NOT EXISTS timescaledb;
-
-CREATE TABLE vehicle_signals (
-    time           TIMESTAMPTZ      NOT NULL,  -- server write time (envelope "time")
-    created_at     TIMESTAMPTZ      NOT NULL,  -- vehicle-side timestamp (data.CreatedAt)
-    vin            TEXT             NOT NULL,   -- 17-char VIN
-    txid           TEXT             NOT NULL,   -- transaction ID
-    signal_name    TEXT             NOT NULL,   -- Field enum name: 'ChargeState', 'VehicleSpeed', etc.
-    value_type     TEXT             NOT NULL,   -- 'string','int','long','float','double',
-                                               -- 'boolean','invalid','location','door',
-                                               -- 'tire','time','enum'
-    value_string   TEXT,                        -- for string & enum type values
-    value_numeric  DOUBLE PRECISION,            -- for int/long/float/double values
-    value_boolean  BOOLEAN,                     -- for boolean values
-    value_json     JSONB,                       -- for complex: location, door, tire
-    is_resend      BOOLEAN          DEFAULT FALSE
-);
-
--- Convert to hypertable with 7-day chunks
-SELECT create_hypertable('vehicle_signals', 'time',
-    chunk_time_interval => INTERVAL '7 days'
-);
-
--- Primary query pattern: signal history for a specific VIN
-CREATE INDEX idx_vs_vin_signal_time
-    ON vehicle_signals (vin, signal_name, time DESC);
-```
-
-**Column mapping from JSONL:**
-
-| JSONL field | Column | Notes |
-|-------------|--------|-------|
-| `time` | `time` | Parse RFC3339 string |
-| `data.CreatedAt` | `created_at` | Parse RFC3339 string |
-| `vin` | `vin` | Direct |
-| `txid` | `txid` | Direct |
-| `data.IsResend` | `is_resend` | Direct |
-| `data.{SignalName}` | `signal_name` | Map key becomes the signal name |
-| `data.{SignalName}.{typeKey}` | `value_type` + appropriate column | See [type mapping](#signal-value-type-mapping) |
-
-#### Signal Value Type Mapping
-
-| JSONL type key | `value_type` | Store in |
-|----------------|-------------|----------|
-| `stringValue` | `string` | `value_string` |
-| `intValue` | `int` | `value_numeric` |
-| `longValue` | `long` | `value_numeric` |
-| `floatValue` | `float` | `value_numeric` |
-| `doubleValue` | `double` | `value_numeric` |
-| `booleanValue` | `boolean` | `value_boolean` |
-| `invalid` | `invalid` | `value_boolean = true` |
-| `locationValue` | `location` | `value_json` — `{"latitude": ..., "longitude": ...}` |
-| `doorValue` | `door` | `value_json` — `{"DriverFront": false, ...}` |
-| `tireLocation` | `tire` | `value_json` — `{"FrontLeft": true, ...}` |
-| `time` | `time` | `value_string` — `"14:30:00"` |
-| `shiftStateValue`, `sentryModeState`, etc. | `enum` | `value_string` — enum string |
-
----
-
-### Table: `vehicle_alerts`
-
-Stores decoded alerts from `alerts.jsonl`.
-
-```sql
-CREATE TABLE vehicle_alerts (
-    time           TIMESTAMPTZ   NOT NULL,  -- server write time
-    vin            TEXT          NOT NULL,
-    txid           TEXT          NOT NULL,
-    alert_name     TEXT          NOT NULL,   -- e.g. "DI_a183_holdReleaseRqrd"
-    audiences      TEXT[],                   -- PostgreSQL array: {'Customer','Service'}
-    started_at     TIMESTAMPTZ,              -- converted from Unix seconds
-    ended_at       TIMESTAMPTZ               -- NULL = still active
-);
-
-SELECT create_hypertable('vehicle_alerts', 'time',
-    chunk_time_interval => INTERVAL '7 days'
-);
-
-CREATE INDEX idx_alerts_vin_time
-    ON vehicle_alerts (vin, time DESC);
-
-CREATE INDEX idx_alerts_name
-    ON vehicle_alerts (alert_name, time DESC);
-```
-
-**Column mapping from JSONL:**
-
-| JSONL field | Column | Notes |
-|-------------|--------|-------|
-| `time` | `time` | Parse RFC3339 |
-| `vin` | `vin` | Direct |
-| `txid` | `txid` | Direct |
-| `data[].Name` | `alert_name` | Unnest array — 1 row per alert |
-| `data[].Audiences` | `audiences` | JSON array → PostgreSQL `TEXT[]` |
-| `data[].StartedAt` | `started_at` | `to_timestamp(unix_seconds)` |
-| `data[].EndedAt` | `ended_at` | `to_timestamp(unix_seconds)` or NULL |
-
----
-
-### Table: `vehicle_connectivity`
-
-Stores connection events from `connectivity.jsonl`. Very low volume.
-
-```sql
-CREATE TABLE vehicle_connectivity (
-    time              TIMESTAMPTZ   NOT NULL,  -- server write time
-    vin               TEXT          NOT NULL,
-    txid              TEXT          NOT NULL,
-    connection_id     TEXT          NOT NULL,   -- UUID session identifier
-    status            TEXT          NOT NULL,   -- 'CONNECTED' | 'DISCONNECTED'
-    network_interface TEXT,                     -- 'wifi' | 'lte'
-    created_at        TIMESTAMPTZ   NOT NULL    -- vehicle-side event timestamp
-);
-
-SELECT create_hypertable('vehicle_connectivity', 'time',
-    chunk_time_interval => INTERVAL '30 days'  -- low volume → larger chunks
-);
-
-CREATE INDEX idx_conn_vin_time
-    ON vehicle_connectivity (vin, time DESC);
-```
-
----
-
-### Table: `vehicle_errors`
-
-Stores diagnostic errors from `errors.jsonl`.
-
-```sql
-CREATE TABLE vehicle_errors (
-    time           TIMESTAMPTZ   NOT NULL,  -- server write time
-    vin            TEXT          NOT NULL,
-    txid           TEXT          NOT NULL,
-    error_name     TEXT          NOT NULL,   -- DTC code
-    body           TEXT,                     -- human-readable description
-    tags           JSONB,                    -- {"severity":"warning","system":"battery"}
-    created_at     TIMESTAMPTZ              -- vehicle-side timestamp
-);
-
-SELECT create_hypertable('vehicle_errors', 'time',
-    chunk_time_interval => INTERVAL '30 days'
-);
-
-CREATE INDEX idx_errors_vin_time
-    ON vehicle_errors (vin, time DESC);
-
-CREATE INDEX idx_errors_name
-    ON vehicle_errors (error_name, time DESC);
-```
-
----
-
-## Compression
-
-TimescaleDB native compression achieves **90–95% storage reduction** on telemetry data.
-Compress chunks older than a configurable threshold (recent data stays uncompressed for
-fast writes and ad-hoc queries).
-
-```sql
--- ── Vehicle signals (compress after 2 days) ──────────────────
-ALTER TABLE vehicle_signals SET (
-    timescaledb.compress,
-    timescaledb.compress_segmentby = 'vin, signal_name',
-    timescaledb.compress_orderby = 'time DESC'
-);
-SELECT add_compression_policy('vehicle_signals', INTERVAL '2 days');
-
--- ── Alerts (compress after 7 days) ───────────────────────────
-ALTER TABLE vehicle_alerts SET (
-    timescaledb.compress,
-    timescaledb.compress_segmentby = 'vin',
-    timescaledb.compress_orderby = 'time DESC'
-);
-SELECT add_compression_policy('vehicle_alerts', INTERVAL '7 days');
-
--- ── Connectivity (compress after 7 days) ─────────────────────
-ALTER TABLE vehicle_connectivity SET (
-    timescaledb.compress,
-    timescaledb.compress_segmentby = 'vin',
-    timescaledb.compress_orderby = 'time DESC'
-);
-SELECT add_compression_policy('vehicle_connectivity', INTERVAL '7 days');
-
--- ── Errors (compress after 7 days) ───────────────────────────
-ALTER TABLE vehicle_errors SET (
-    timescaledb.compress,
-    timescaledb.compress_segmentby = 'vin',
-    timescaledb.compress_orderby = 'time DESC'
-);
-SELECT add_compression_policy('vehicle_errors', INTERVAL '7 days');
-```
-
-### Why these `segmentby` choices?
-
-- **`vin, signal_name`** for `vehicle_signals`: Queries almost always filter on
-  both VIN and signal name. Segmenting by both means TimescaleDB can skip
-  irrelevant segments entirely during decompression.
-- **`vin`** for other tables: Lower volume, VIN is the primary filter dimension.
-
----
-
-## Retention Policies
-
-Automatically drop data older than a configurable period:
-
-```sql
--- Keep 1 year of data (adjust as needed)
-SELECT add_retention_policy('vehicle_signals',      INTERVAL '1 year');
-SELECT add_retention_policy('vehicle_alerts',       INTERVAL '1 year');
-SELECT add_retention_policy('vehicle_connectivity', INTERVAL '1 year');
-SELECT add_retention_policy('vehicle_errors',       INTERVAL '1 year');
-```
-
-> **Tip:** If you need long-term analytics, set up continuous aggregates *before*
-> retention drops the raw data. The aggregates survive independently.
-
----
-
-## Continuous Aggregates
-
-Pre-computed materialized views that TimescaleDB keeps up-to-date automatically.
-Essential for dashboards and reporting queries.
-
-### Hourly Signal Summary
-
-```sql
-CREATE MATERIALIZED VIEW vehicle_signals_hourly
-WITH (timescaledb.continuous) AS
-SELECT
-    time_bucket('1 hour', time)  AS bucket,
-    vin,
-    signal_name,
-    avg(value_numeric)           AS avg_value,
-    min(value_numeric)           AS min_value,
-    max(value_numeric)           AS max_value,
-    count(*)                     AS sample_count
-FROM vehicle_signals
-WHERE value_numeric IS NOT NULL
-GROUP BY bucket, vin, signal_name
-WITH NO DATA;
-
-SELECT add_continuous_aggregate_policy('vehicle_signals_hourly',
-    start_offset    => INTERVAL '3 hours',
-    end_offset      => INTERVAL '1 hour',
-    schedule_interval => INTERVAL '1 hour'
-);
-```
-
-### Daily Alert Summary
-
-```sql
-CREATE MATERIALIZED VIEW alerts_daily
-WITH (timescaledb.continuous) AS
-SELECT
-    time_bucket('1 day', time)   AS bucket,
-    vin,
-    alert_name,
-    count(*)                     AS alert_count
-FROM vehicle_alerts
-GROUP BY bucket, vin, alert_name
-WITH NO DATA;
-
-SELECT add_continuous_aggregate_policy('alerts_daily',
-    start_offset    => INTERVAL '2 days',
-    end_offset      => INTERVAL '1 hour',
-    schedule_interval => INTERVAL '1 hour'
-);
-```
-
-### Latest Vehicle State (Pivot View)
-
-If you need a "wide" view showing the latest value for every signal:
-
-```sql
-CREATE VIEW vehicle_latest_state AS
-SELECT DISTINCT ON (vin, signal_name)
-    vin,
-    signal_name,
-    time,
-    value_type,
-    value_string,
-    value_numeric,
-    value_boolean,
-    value_json
-FROM vehicle_signals
-ORDER BY vin, signal_name, time DESC;
-```
-
----
-
-## Ingestion Strategy
-
-### Transforming `V.jsonl`
-
-Each JSONL line produces **multiple rows** — one per signal field in `data`.
-Skip the envelope fields (`Vin`, `CreatedAt`, `IsResend`) as signal rows;
-they become metadata columns on every row.
-
-**Input (1 JSONL line):**
 ```json
-{
-  "vin": "7SAYGDEE2PF875122",
-  "time": "2026-01-30T21:26:53Z",
-  "txid": "252624a96e834cc69602ac-000000001",
-  "data": {
-    "Vin": "7SAYGDEE2PF875122",
-    "CreatedAt": "2026-01-30T21:26:40Z",
-    "IsResend": false,
-    "ChargeState": {"stringValue": "Idle"},
-    "VehicleSpeed": {"doubleValue": 0.0}
-  }
-}
+"timescale": {
+  "dsn": "postgresql://postgres:postgres@192.168.18.2:5432/fleet_telemetry",
+  "batch_size": 500,
+  "flush_interval_ms": 2000
+},
+"records": { "V": ["timescale"], "alerts": ["timescale"],
+             "errors": ["timescale"], "connectivity": ["timescale"] }
 ```
 
-**Output (2 rows):**
+---
 
-| time | created_at | vin | txid | signal_name | value_type | value_string | value_numeric | is_resend |
-|------|-----------|-----|------|-------------|-----------|-------------|--------------|-----------|
-| 2026-01-30T21:26:53Z | 2026-01-30T21:26:40Z | 7SAY... | 252624... | ChargeState | string | Idle | NULL | false |
-| 2026-01-30T21:26:53Z | 2026-01-30T21:26:40Z | 7SAY... | 252624... | VehicleSpeed | double | NULL | 0.0 | false |
+## Schema (`schema.sql`)
 
-**Pseudocode:**
-```python
-for line in open("V.jsonl"):
-    record = json.loads(line)
-    envelope_time = record["time"]
-    vin = record["vin"]
-    txid = record["txid"]
-    data = record["data"]
-    created_at = data.pop("CreatedAt")
-    is_resend = data.pop("IsResend", False)
-    data.pop("Vin", None)
+### Principles
 
-    for signal_name, value_wrapper in data.items():
-        value_type, value = next(iter(value_wrapper.items()))
-        row = {
-            "time": envelope_time,
-            "created_at": created_at,
-            "vin": vin,
-            "txid": txid,
-            "signal_name": signal_name,
-            "value_type": value_type.replace("Value", ""),
-            "value_string": value if isinstance(value, str) else None,
-            "value_numeric": value if isinstance(value, (int, float)) and not isinstance(value, bool) else None,
-            "value_boolean": value if isinstance(value, bool) else None,
-            "value_json": json.dumps(value) if isinstance(value, dict) else None,
-            "is_resend": is_resend,
-        }
-        # INSERT or batch for COPY
+1. **Change-only fact table.** `signal_changes` gets a row only when a
+   signal's value differs from its previous value for that vehicle.
+   Repeats are dropped at ingest (measured: −71.8% of rows). This also
+   means the table *is* the delta encoding — the filewriter's
+   `enable_delta` becomes unnecessary.
+2. **No envelope blobs.** `payload`, `decoded_payload`, `metadata` are
+   never stored (−72% of bytes). The only useful scrap of metadata,
+   `device_client_version`, lives on the `vehicles` row.
+3. **Integer surrogate keys.** `vehicle_id smallint` + `signal_id
+   smallint` (4 bytes total) instead of repeating a 17-char VIN and a
+   ~15-char signal name per row. `signal_id` equals the proto `Field`
+   enum number (1–259, seeded from `protos/vehicle_data.proto`), so ids
+   are stable and meaningful; unknown future signals auto-register at
+   ids ≥ 1000.
+4. **No per-row type tag.** One nullable column per storage class
+   (`v_num float8`, `v_long bigint`, `v_bool`, `v_text`, `v_loc point`,
+   `v_json jsonb`, `invalid bool`); a NULL costs one bit. `v_long`
+   keeps int64 exact (no float8 precision loss). Each signal always
+   uses the same column, recorded informationally in `signals`.
+5. **Current state is a table, not a scan.** `signal_latest` (one row
+   per vehicle × signal, PK-indexed) is upserted at ingest. "What's the
+   car's state now" never touches the hypertable — important at fleet
+   scale where a `DISTINCT ON` over all history would scan every chunk.
+6. **Alerts are episodes.** PK `(vehicle_id, alert_id, started_at)`;
+   the closing re-send fills `ended_at` via upsert. Open alerts =
+   `ended_at IS NULL` (partial index).
+7. **Idempotency without bookkeeping.** Connectivity and errors insert
+   on natural keys (`ON CONFLICT DO NOTHING`), alerts upsert per
+   episode, and a signal observation is stored only when it is strictly
+   newer than the stored latest *and* its value changed — so replaying
+   any JSONL file (or a vehicle retransmission) writes nothing.
+
+### Hypertable & compression
+
+```sql
+SELECT create_hypertable('signal_changes', 'ts', chunk_time_interval => INTERVAL '7 days');
+ALTER TABLE signal_changes SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'vehicle_id, signal_id',
+    timescaledb.compress_orderby   = 'ts DESC');
+SELECT add_compression_policy('signal_changes', INTERVAL '14 days');
 ```
 
-### Transforming `alerts.jsonl`
+* Partition column is `ts` = the **vehicle-side** `CreatedAt` (what you
+  filter on analytically), not the server write time.
+* Segment-by `(vehicle_id, signal_id)` stores each series contiguously;
+  measured compression on the real data: 4,680 kB → 1,864 kB (2.5×) *on
+  top of* the 3.5× from change-only dedup.
+* **Chunk sizing rule:** aim for chunks of 5–25M rows that fit in RAM.
+  At the observed rate (~100 change-rows/vehicle/day), 7-day chunks are
+  fine up to several thousand vehicles. If you raise the telemetry
+  config to second-level streaming, recompute: `rows/day = vehicles ×
+  signals-changing/sec × 86,400 × 0.28` and shrink
+  `chunk_time_interval` to keep chunks in that envelope.
 
-Unnest the `data[]` array — one row per alert per JSONL line.
+### Only `signal_changes` is a hypertable
 
-```python
-for line in open("alerts.jsonl"):
-    record = json.loads(line)
-    for alert in record["data"]:
-        row = {
-            "time": record["time"],
-            "vin": record["vin"],
-            "txid": record["txid"],
-            "alert_name": alert["Name"],
-            "audiences": alert.get("Audiences"),          # → TEXT[]
-            "started_at": to_timestamp(alert.get("StartedAt")),
-            "ended_at": to_timestamp(alert.get("EndedAt")),
-        }
-```
+Alerts (640 rows), connectivity (5.7k rows) and errors (361 rows) are
+plain tables: their volume is negligible, and plain tables allow the
+natural-key PKs that give us dedup/upserts (hypertables require the
+time column in every unique constraint). Even at 300 vehicles for 5
+years, connectivity is only ~25M small rows — revisit then; migrating
+is one `create_hypertable()` call.
 
-### Transforming `connectivity.jsonl`
+---
 
-Direct 1:1 mapping — each JSONL line becomes one row.
-
-```python
-for line in open("connectivity.jsonl"):
-    record = json.loads(line)
-    data = record["data"]
-    row = {
-        "time": record["time"],
-        "vin": record["vin"],
-        "txid": record["txid"],
-        "connection_id": data["ConnectionID"],
-        "status": data["Status"],
-        "network_interface": data["NetworkInterface"],
-        "created_at": to_timestamp(data["CreatedAt"]),
-    }
-```
-
-### Transforming `errors.jsonl`
-
-Unnest the `data[]` array (may be empty).
-
-```python
-for line in open("errors.jsonl"):
-    record = json.loads(line)
-    for error in record["data"]:
-        row = {
-            "time": record["time"],
-            "vin": record["vin"],
-            "txid": record["txid"],
-            "error_name": error["Name"],
-            "body": error.get("Body"),
-            "tags": json.dumps(error.get("Tags")) if error.get("Tags") else None,
-            "created_at": to_timestamp(error.get("CreatedAt")),
-        }
-```
-
-### Batch Loading with COPY
-
-For bulk historical loading, use PostgreSQL `COPY` for maximum throughput:
+## Setup & operation
 
 ```bash
-# Convert JSONL to CSV, then load
-python3 transform_v_jsonl.py V.jsonl | \
-  psql -c "COPY vehicle_signals FROM STDIN WITH CSV HEADER" \
-       -d fleet_telemetry
+cd new_implementation
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+# 1. create DB, apply schema.sql, seed 259 signals from the proto
+.venv/bin/python scripts/setup_db.py            # --drop to recreate
+
+# 2. one-time backfill of the historical JSONL files
+.venv/bin/python scripts/ingest_jsonl.py
+
+# 3. run the server with the timescale producer for live data
+#    (see timescale-server-config.json) — no more JSONL files
 ```
 
-For real-time ingestion, use batched `INSERT` with `unnest()`:
+Re-running the backfill at any time is safe (verified: a full replay
+writes 0 duplicate rows and picks up only lines appended since). The
+ingester accepts every record shape the server ever produced:
+typed wrappers (`{"doubleValue": 1.5}`) and bare values, full records,
+`snapshot`/`delta` records (a `null` value = signal dropped from the
+delta baseline → ignored), and old-format files (`V_old.jsonl`).
+
+### Retention (optional)
+
+Change-only rows are so small that you may simply keep everything. If
+you do want a cap:
 
 ```sql
-INSERT INTO vehicle_signals (time, created_at, vin, txid, signal_name,
-                             value_type, value_string, value_numeric,
-                             value_boolean, value_json, is_resend)
-SELECT * FROM unnest(
-    $1::timestamptz[],  -- time
-    $2::timestamptz[],  -- created_at
-    $3::text[],         -- vin
-    $4::text[],         -- txid
-    $5::text[],         -- signal_name
-    $6::text[],         -- value_type
-    $7::text[],         -- value_string
-    $8::float8[],       -- value_numeric
-    $9::boolean[],      -- value_boolean
-    $10::jsonb[],       -- value_json
-    $11::boolean[]      -- is_resend
-);
+SELECT add_retention_policy('signal_changes', INTERVAL '3 years');
+```
+
+`signal_latest`, `alert_episodes`, etc. are unaffected — current state
+and alert history survive raw-data retention.
+
+---
+
+## Querying change-only data
+
+The one conceptual shift: **absence of rows means "value unchanged",
+not "no data".** For point-in-time and charting queries use
+TimescaleDB's `locf()` (last observation carried forward).
+
+Current state of a car — instant, no hypertable scan:
+
+```sql
+SELECT signal, ts, value FROM v_current_state WHERE vin = '5YJ3E1EA2JF013888';
+```
+
+History of one signal (only the changes, which is usually what you want):
+
+```sql
+SELECT ts, v_text FROM v_signal_history
+WHERE vin = '5YJ3E1EA2JF013888' AND signal = 'ChargeState'
+ORDER BY ts DESC LIMIT 100;
+```
+
+Battery level chart, gap-filled hourly (validated on real data):
+
+```sql
+SELECT time_bucket_gapfill('1 hour', ts) AS hour,
+       locf(avg(v_num)) AS battery_pct
+FROM signal_changes c
+JOIN vehicles v USING (vehicle_id)
+JOIN signals  s USING (signal_id)
+WHERE v.vin = '5YJ3E1EA2JF013888' AND s.name = 'BatteryLevel'
+  AND ts BETWEEN now() - INTERVAL '7 days' AND now()
+GROUP BY hour ORDER BY hour;
+```
+
+Value of a signal at an arbitrary past instant:
+
+```sql
+SELECT v_num FROM signal_changes
+WHERE vehicle_id = 1 AND signal_id = 42      -- BatteryLevel
+  AND ts <= '2026-04-01 12:00+00'
+ORDER BY ts DESC LIMIT 1;
+```
+
+Open alerts / alert frequency / connection sessions:
+
+```sql
+SELECT * FROM v_open_alerts;
+
+SELECT t.name, count(*), min(started_at), max(started_at)
+FROM alert_episodes a JOIN alert_types t USING (alert_id)
+WHERE a.vehicle_id = 1 AND started_at >= now() - INTERVAL '30 days'
+GROUP BY t.name ORDER BY count(*) DESC;
+
+SELECT * FROM v_connection_sessions WHERE vin = '5YJ3E1EA2JF013888'
+ORDER BY connected_at DESC LIMIT 20;
+```
+
+> **Continuous-aggregate caveat:** don't build naive `avg(value)`
+> rollups over `signal_changes` — with repeats removed, a plain average
+> over-weights volatile periods. Use `locf()`/`time_weight()` (the
+> `time_weight('locf', ...)` aggregate from the timescaledb_toolkit) if
+> you need statistically correct rollups.
+
+---
+
+## Scaling to hundreds of cars
+
+| Lever | Setting |
+|---|---|
+| Rows | change-only ingest already drops ~72%; the duplication factor *grows* with reporting frequency, so faster telemetry configs gain even more |
+| Chunk interval | 7 days now; shrink if you raise telemetry frequency (rule above) |
+| Compression | policy compresses chunks > 14 days old automatically |
+| Current-state queries | `signal_latest` keeps them O(vehicles × signals), independent of history size |
+| Ingest throughput | the Go producer batches `COPY` inserts (500 rows / 2 s flush) with in-memory change detection — no file I/O at all |
+| Postgres tuning | the container runs 128MB `shared_buffers`; for a 300-car fleet give it 2–4 GB RAM, `shared_buffers` ≈ 25% of that |
+
+Estimated storage at observed per-car rates: **~3.3 MB/vehicle-year**
+(compressed, incl. indexes). 300 cars ≈ 1 GB/year. If your telemetry
+config streams 100× more frequently, plan ~100 GB/year — still far from
+"hundreds of gigabytes of repetitive values", because repeats never
+reach disk.
+
+---
+
+## Files in this folder
+
+| File | Purpose |
+|---|---|
+| `schema.sql` | Complete DDL: tables, hypertable, compression, views |
+| `timescale-server-config.json` | Example server config using the `timescale` producer |
+| `../datastore/timescale/producer.go` | Go producer: server → TimescaleDB directly (lives in the Go module) |
+| `scripts/setup_db.py` | Create DB + apply schema + seed signal dictionary from the proto |
+| `scripts/ingest_jsonl.py` | One-time historical backfill of the old JSONL files |
+| `scripts/inspect_telemetry.py` | Redundancy/shape analyzer for the JSONL data |
+| `scripts/generate_openapi.py` | Regenerates `fleet-telemetry-output.openapi.yaml` from protos + transformer source |
+| `fleet-telemetry-output.openapi.yaml` | **Generated** JSONL output schema — do not edit by hand |
+
+When the protos or transformers change (new firmware signals, new value
+types), re-run:
+
+```bash
+.venv/bin/python scripts/generate_openapi.py   # refresh the spec
+.venv/bin/python scripts/setup_db.py           # upsert new signal names/ids
 ```
 
 ---
 
-## Example Queries
+## Switching the server to direct database writes
 
-### Get the latest state of a vehicle
+`datastore/timescale/producer.go` implements `telemetry.Producer`:
 
-```sql
-SELECT DISTINCT ON (signal_name)
-    signal_name,
-    value_type,
-    COALESCE(value_string, value_numeric::text, value_boolean::text) AS value,
-    time
-FROM vehicle_signals
-WHERE vin = '7SAYGDEE2PF875122'
-ORDER BY signal_name, time DESC;
-```
+1. Build the server (the standard `Dockerfile` / `make` — pgx is a pure
+   Go dependency, nothing extra to install).
+2. Point the config at the database and route all record types to
+   `timescale` (full example: `timescale-server-config.json`).
+3. Remove the `filewriter` entries from `records` — JSONL output stops.
 
-### ChargeState history for a vehicle
-
-```sql
-SELECT time, value_string AS charge_state
-FROM vehicle_signals
-WHERE vin = '7SAYGDEE2PF875122'
-  AND signal_name = 'ChargeState'
-  AND time >= NOW() - INTERVAL '7 days'
-ORDER BY time DESC;
-```
-
-### Average speed over time (hourly buckets)
-
-```sql
-SELECT
-    time_bucket('1 hour', time) AS hour,
-    avg(value_numeric)          AS avg_speed,
-    max(value_numeric)          AS max_speed
-FROM vehicle_signals
-WHERE vin = '7SAYGDEE2PF875122'
-  AND signal_name = 'VehicleSpeed'
-  AND time >= NOW() - INTERVAL '24 hours'
-GROUP BY hour
-ORDER BY hour;
-```
-
-### Active alerts for a vehicle
-
-```sql
-SELECT alert_name, audiences, started_at
-FROM vehicle_alerts
-WHERE vin = '7SAYGDEE2PF875122'
-  AND ended_at IS NULL
-ORDER BY started_at DESC;
-```
-
-### Connection sessions with duration
-
-```sql
-SELECT
-    c1.connection_id,
-    c1.network_interface,
-    c1.created_at AS connected_at,
-    c2.created_at AS disconnected_at,
-    c2.created_at - c1.created_at AS duration
-FROM vehicle_connectivity c1
-LEFT JOIN vehicle_connectivity c2
-    ON c1.connection_id = c2.connection_id
-    AND c2.status = 'DISCONNECTED'
-WHERE c1.vin = '7SAYGDEE2PF875122'
-  AND c1.status = 'CONNECTED'
-ORDER BY c1.created_at DESC;
-```
-
-### Alert frequency report
-
-```sql
-SELECT
-    alert_name,
-    count(*) AS occurrences,
-    min(started_at) AS first_seen,
-    max(started_at) AS last_seen
-FROM vehicle_alerts
-WHERE vin = '7SAYGDEE2PF875122'
-  AND time >= NOW() - INTERVAL '30 days'
-GROUP BY alert_name
-ORDER BY occurrences DESC;
-```
-
-### Battery level trend (using continuous aggregate)
-
-```sql
-SELECT bucket, avg_value AS avg_battery, min_value, max_value
-FROM vehicle_signals_hourly
-WHERE vin = '7SAYGDEE2PF875122'
-  AND signal_name = 'BatteryLevel'
-  AND bucket >= NOW() - INTERVAL '7 days'
-ORDER BY bucket;
-```
-
----
-
-## Docker Setup
-
-Add TimescaleDB to your existing `docker-compose.yml`:
-
-```yaml
-services:
-  timescaledb:
-    image: timescale/timescaledb:latest-pg16
-    container_name: fleet-timescaledb
-    restart: unless-stopped
-    ports:
-      - "5432:5432"
-    environment:
-      POSTGRES_DB: fleet_telemetry
-      POSTGRES_USER: fleet
-      POSTGRES_PASSWORD: ${TIMESCALE_PASSWORD:-fleet_telemetry_dev}
-    volumes:
-      - timescaledb_data:/var/lib/postgresql/data
-      - ./doc/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
-    # Performance tuning for telemetry workloads
-    command:
-      - postgres
-      - -c
-      - shared_buffers=256MB
-      - -c
-      - work_mem=16MB
-      - -c
-      - maintenance_work_mem=256MB
-      - -c
-      - max_wal_size=2GB
-      - -c
-      - checkpoint_completion_target=0.9
-      - -c
-      - effective_cache_size=1GB
-
-volumes:
-  timescaledb_data:
-```
-
-### Connection string
-
-```
-postgresql://fleet:fleet_telemetry_dev@localhost:5432/fleet_telemetry
-```
-
----
-
-## Storage Estimates
-
-Based on observed data rates (~2.3 records/sec per vehicle, ~3 signals/record):
-
-### Per Vehicle
-
-| Period | Signal rows | Uncompressed | Compressed (~10:1) |
-|--------|------------|-------------|-------------------|
-| 1 hour | ~24,840 | ~5 MB | ~500 KB |
-| 1 day | ~596,160 | ~120 MB | ~12 MB |
-| 1 month | ~18M | ~3.6 GB | ~360 MB |
-| 1 year | ~216M | ~43 GB | ~4.3 GB |
-
-### Fleet Scaling
-
-| Vehicles | 1-year compressed | 1-year uncompressed |
-|----------|------------------|-------------------|
-| 1 | 4.3 GB | 43 GB |
-| 10 | 43 GB | 430 GB |
-| 100 | 430 GB | 4.3 TB |
-| 1,000 | 4.3 TB | 43 TB |
-
-> **Recommendation:** For 100+ vehicles, consider:
-> - Adding `vin` as a **space partition** dimension on the hypertable
-> - Using TimescaleDB's **tiered storage** to move old compressed data to S3
-> - Adjusting chunk intervals (smaller for high-volume tables)
-
-### Checking Compression Stats
-
-```sql
--- Overall compression ratio
-SELECT
-    hypertable_name,
-    pg_size_pretty(before_compression_total_bytes) AS before,
-    pg_size_pretty(after_compression_total_bytes) AS after,
-    round(
-        (1 - after_compression_total_bytes::numeric
-           / before_compression_total_bytes::numeric) * 100, 1
-    ) AS compression_pct
-FROM hypertable_compression_stats('vehicle_signals');
-```
-
----
-
-## Performance Tips
-
-1. **Batch inserts**: Never insert one row at a time. Use `COPY` or batch
-   `INSERT` with `unnest()` arrays. Aim for 1,000–10,000 rows per batch.
-
-2. **Avoid frequent decompression**: Don't update or delete rows in compressed
-   chunks. If you need to backfill, decompress → insert → recompress.
-
-3. **Index sparingly**: The `(vin, signal_name, time DESC)` index covers most
-   query patterns. Add more indexes only after profiling actual queries.
-
-4. **Use continuous aggregates for dashboards**: Don't run expensive `GROUP BY`
-   queries on raw data for recurring dashboard panels.
-
-5. **Monitor chunk sizes**: Run `SELECT * FROM timescaledb_information.chunks`
-   to verify chunk counts and sizes are reasonable.
-
-6. **Connection pooling**: Use PgBouncer for high-throughput ingestion to avoid
-   exhausting PostgreSQL connection slots.
+On startup the producer loads `signal_latest` once (state survives
+restarts), then: V payloads go through the same typed-value
+classification as the transformers, unchanged values are dropped in
+memory, changes are buffered and flushed with `COPY` (batch_size /
+flush_interval_ms), and `signal_latest` is upserted in the same flush.
+Alerts, errors and connectivity use the upsert/natural-key paths, so
+vehicle retransmissions remain harmless. If both the old filewriter and
+the new producer ran in parallel for a while, the backfill script can
+replay the overlap — idempotency guarantees no duplicates.

@@ -23,6 +23,7 @@ import (
 	"github.com/teslamotors/fleet-telemetry/datastore/kinesis"
 	"github.com/teslamotors/fleet-telemetry/datastore/mqtt"
 	"github.com/teslamotors/fleet-telemetry/datastore/simple"
+	"github.com/teslamotors/fleet-telemetry/datastore/timescale"
 	"github.com/teslamotors/fleet-telemetry/datastore/zmq"
 	logrus "github.com/teslamotors/fleet-telemetry/logger"
 	"github.com/teslamotors/fleet-telemetry/metrics"
@@ -82,6 +83,9 @@ type Config struct {
 
 	// FileWriterConfig configures the file writer
 	FileWriterConfig *simple.FileWriterConfig `json:"filewriter,omitempty"`
+
+	// Timescale configures the TimescaleDB writer
+	Timescale *timescale.Config `json:"timescale,omitempty"`
 
 	// LogLevel set the log-level
 	LogLevel string `json:"log_level,omitempty"`
@@ -295,6 +299,17 @@ func (c *Config) ConfigureProducers(airbrakeHandler *airbrake.Handler, logger *l
 		for _, dispatchRule := range dispatchRules {
 			requiredDispatchers[dispatchRule] = append(requiredDispatchers[dispatchRule], recordName)
 		}
+	}
+
+	if _, ok := requiredDispatchers[telemetry.Timescale]; ok {
+		if c.Timescale == nil {
+			return nil, nil, errors.New("expected Timescale to be configured")
+		}
+		timescaleProducer, err := timescale.NewProducer(context.Background(), c.Timescale, logger)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create timescale producer: %w", err)
+		}
+		producers[telemetry.Timescale] = timescaleProducer
 	}
 
 	if _, ok := requiredDispatchers[telemetry.Kafka]; ok {

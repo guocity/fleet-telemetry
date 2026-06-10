@@ -24,6 +24,8 @@ const (
 	MQTT Dispatcher = "mqtt"
 	// FileWriter registers a file writer
 	FileWriter Dispatcher = "filewriter"
+	// Timescale registers a TimescaleDB writer
+	Timescale Dispatcher = "timescale"
 )
 
 // BuildTopicName creates a topic from a namespace and a recordName
