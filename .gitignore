@@ -9,6 +9,7 @@ temp
 test/integration/test-certs/
 telemetry-data
 api-response/
+certs/
 *.env
 **/partner_token.txt
 **/thirdparty_token.txt
