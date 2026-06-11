@@ -8,6 +8,7 @@ config-local.json
 temp
 test/integration/test-certs/
 telemetry-data
+tesla-fleet-data-browser
 api-response/
 certs/
 *.env
