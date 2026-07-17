@@ -26,6 +26,8 @@ const (
 	FileWriter Dispatcher = "filewriter"
 	// Timescale registers a TimescaleDB writer
 	Timescale Dispatcher = "timescale"
+	// Redis registers a Redis pub/sub dispatcher
+	Redis Dispatcher = "redis"
 )
 
 // BuildTopicName creates a topic from a namespace and a recordName
